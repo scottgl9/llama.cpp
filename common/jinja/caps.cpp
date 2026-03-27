@@ -472,6 +472,11 @@ caps caps_get(jinja::program & prog) {
         }
     );
 
+    // If detection failed both ways, default to string content
+    if (!result.supports_string_content && !result.supports_typed_content) {
+        result.supports_string_content = true;
+    }
+
     JJ_DEBUG("%s\n", result.to_string().c_str());
 
     return result;
