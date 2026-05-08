@@ -3465,9 +3465,12 @@ void llama_context::handle_mtp_for_ubatch(
     // Partition the ubatch into runs that share a seq_id and have contiguous
     // positions. Each run is processed independently against its own per-seq
     // pending shift state, so concurrent slots don't stomp on each other.
+    // Stack-allocated to keep the hot path allocation-free; n_groups is bounded
+    // by n_parallel which is small in practice.
     struct group { int begin; int end; llama_seq_id sid; };
-    std::vector<group> groups;
-    groups.reserve(8);
+    constexpr int MAX_GROUPS = 32;
+    group   groups[MAX_GROUPS];
+    int32_t n_groups = 0;
     {
         int gs = 0;
         for (int i = 1; i < n_tokens; ++i) {
@@ -3475,21 +3478,21 @@ void llama_context::handle_mtp_for_ubatch(
             const llama_seq_id sid_curr = seq_id[i][0];
             const bool pos_contig = positions[i] == positions[i - 1] + 1;
             if (sid_curr != sid_prev || !pos_contig) {
-                groups.push_back({ gs, i, sid_prev });
+                if (n_groups < MAX_GROUPS) groups[n_groups++] = { gs, i, sid_prev };
                 gs = i;
             }
         }
-        groups.push_back({ gs, (int) n_tokens, seq_id[n_tokens - 1][0] });
+        if (n_groups < MAX_GROUPS) groups[n_groups++] = { gs, (int) n_tokens, seq_id[n_tokens - 1][0] };
     }
 
-    bool synced = false;
+    bool     synced         = false;
+    uint32_t group_emit_msk = 0; // bit gi = 1 if group gi emitted rows / will stash pending
 
     // Build the merged hook batch: pending-continues row (if any) followed by
     // the (n-1) shift rows for each non-skipped group.
     int out_idx = 0;
-    std::vector<int> group_emit(groups.size(), 0); // 1 = group emitted rows / will stash pending
 
-    for (size_t gi = 0; gi < groups.size(); ++gi) {
+    for (int gi = 0; gi < n_groups; ++gi) {
         const auto & g = groups[gi];
         const int g_n = g.end - g.begin;
         const llama_pos g_pos_start = positions[g.begin];
@@ -3512,7 +3515,7 @@ void llama_context::handle_mtp_for_ubatch(
         if (n_out_g <= 0) {
             // Single-token group with no carry — nothing to decode but we
             // still want to stash this row as pending.
-            group_emit[gi] = 1;
+            group_emit_msk |= (1u << gi);
             continue;
         }
 
@@ -3558,8 +3561,8 @@ void llama_context::handle_mtp_for_ubatch(
     }
 
     // Stash each emitted group's last h-row as the new pending for that seq.
-    for (size_t gi = 0; gi < groups.size(); ++gi) {
-        if (!group_emit[gi]) continue;
+    for (int gi = 0; gi < n_groups; ++gi) {
+        if (!(group_emit_msk & (1u << gi))) continue;
         const auto & g = groups[gi];
         auto & seq_state = mtp.seq_states[g.sid];
         if ((int) seq_state.pending_h.size() != n_embd) {
