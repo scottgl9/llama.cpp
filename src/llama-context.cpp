@@ -3743,7 +3743,7 @@ bool llama_context_seq_rm(
     const bool ok = llama_memory_seq_rm(llama_get_memory(ctx), seq_id, p0, p1);
 
     if (llama_context * ctx_mtp = ctx->get_mtp()) {
-        llama_memory_seq_rm(llama_get_memory(ctx_mtp), 0, p0, p1);
+        llama_memory_seq_rm(llama_get_memory(ctx_mtp), seq_id, p0, p1);
     }
     return ok;
 }

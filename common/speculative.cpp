@@ -145,7 +145,7 @@ struct common_speculative_state {
 
     virtual ~common_speculative_state() = default;
 
-    virtual void begin(const llama_tokens & prompt, llama_seq_id seq_id) = 0;
+    virtual void begin(const llama_tokens & prompt, llama_seq_id seq_id, int32_t tgt_row) = 0;
 
     virtual void draft(
             const common_params_speculative & params,
@@ -154,7 +154,7 @@ struct common_speculative_state {
             llama_tokens & result,
             llama_seq_id seq_id) = 0;
 
-    virtual void accept(uint16_t n_accepted, llama_seq_id seq_id) = 0;
+    virtual void accept(uint16_t n_accepted, llama_seq_id seq_id, int32_t tgt_row) = 0;
 
     virtual int32_t n_max(const common_params_speculative & params) const = 0;
     virtual int32_t n_min(const common_params_speculative & params) const = 0;
@@ -251,7 +251,7 @@ struct common_speculative_state_draft : public common_speculative_state {
         llama_batch_free(batch);
     }
 
-    void begin(const llama_tokens & /*prompt*/, llama_seq_id /*seq_id*/) override {
+    void begin(const llama_tokens & /*prompt*/, llama_seq_id /*seq_id*/, int32_t /*tgt_row*/) override {
     }
 
     size_t create_checkpoint(int n_tokens_prompt) {
@@ -529,7 +529,7 @@ struct common_speculative_state_draft : public common_speculative_state {
         }
     }
 
-    void accept(uint16_t n_accepted, llama_seq_id /*seq_id*/) override {
+    void accept(uint16_t n_accepted, llama_seq_id /*seq_id*/, int32_t /*tgt_row*/) override {
         // noop
         GGML_UNUSED(n_accepted);
     }
@@ -574,7 +574,7 @@ struct common_speculative_state_draft : public common_speculative_state {
 struct common_speculative_state_eagle3 : public common_speculative_state {
     common_speculative_state_eagle3(enum common_speculative_type type) : common_speculative_state(type) {}
 
-    void begin(const llama_tokens & prompt, llama_seq_id /*seq_id*/) override {
+    void begin(const llama_tokens & prompt, llama_seq_id /*seq_id*/, int32_t /*tgt_row*/) override {
         GGML_UNUSED(prompt);
     }
 
@@ -591,7 +591,7 @@ struct common_speculative_state_eagle3 : public common_speculative_state {
         GGML_UNUSED(draft_tokens);
     }
 
-    void accept(uint16_t n_accepted, llama_seq_id /*seq_id*/) override {
+    void accept(uint16_t n_accepted, llama_seq_id /*seq_id*/, int32_t /*tgt_row*/) override {
         // noop
         GGML_UNUSED(n_accepted);
     }
@@ -618,6 +618,9 @@ struct common_speculative_state_mtp : public common_speculative_state {
         common_sampler * smpl            = nullptr;
         uint16_t         last_n_drafted  = 0;
         int32_t          last_n_accepted = -1;
+        // Trunk-batch row of this seq's last accepted/prefill token in ctx_tgt's
+        // most-recent decoded ubatch. -1 means unknown -> fall back to last row.
+        int32_t          pending_tgt_row = -1;
     };
     std::unordered_map<llama_seq_id, seq_state> seqs;
 
@@ -667,10 +670,11 @@ struct common_speculative_state_mtp : public common_speculative_state {
         }
     }
 
-    void begin(const llama_tokens & prompt, llama_seq_id seq_id) override {
+    void begin(const llama_tokens & prompt, llama_seq_id seq_id, int32_t tgt_row) override {
         auto & s = get_seq(seq_id);
         s.last_n_accepted = -1;
         s.last_n_drafted  = 0;
+        s.pending_tgt_row = tgt_row;
 
         const int32_t N = (int32_t) prompt.size();
         if (N <= 0) {
@@ -725,14 +729,27 @@ struct common_speculative_state_mtp : public common_speculative_state {
             int32_t       src_row;
             if (k == 0) {
                 src = llama_context_get_t_h_pre_norm(ctx_tgt);
-                if (s.last_n_accepted < 0) {
-                    // First draft after begin(): trunk's most recent decode is
-                    // the last prefill ubatch; its last row is h_{N-1}.
-                    src_row = (src && src->ne[1] > 0) ? (int32_t) src->ne[1] - 1 : 0;
-                } else {
-                    src_row = s.last_n_accepted;
-                }
+                // The conditioning hidden state lives at the trunk row of this
+                // seq's last prefill/accepted token in ctx_tgt's most-recent
+                // ubatch. Server passes that row via begin/accept; with
+                // n_parallel > 1 it is NOT the same as last_n_accepted because
+                // the merged batch interleaves multiple slots' tokens.
                 llama_synchronize(ctx_tgt);
+                const int32_t n_rows_tgt = (src && src->ne[1] > 0) ? (int32_t) src->ne[1] : 0;
+                // Use the explicit row whenever the server has provided one and
+                // it still fits in the current t_h_pre_norm. Don't clear it —
+                // accept()/begin() refresh it on every iter that updates the
+                // trunk's last decode.
+                if (s.pending_tgt_row >= 0 && s.pending_tgt_row < n_rows_tgt) {
+                    src_row = s.pending_tgt_row;
+                } else if (s.last_n_accepted < 0) {
+                    // legacy fallback: last row of the last decode
+                    src_row = n_rows_tgt > 0 ? n_rows_tgt - 1 : 0;
+                } else if (s.last_n_accepted < n_rows_tgt) {
+                    src_row = s.last_n_accepted;
+                } else {
+                    src_row = n_rows_tgt > 0 ? n_rows_tgt - 1 : 0;
+                }
             } else {
                 // for the AR path get the mtp_out from the mtp ctx
                 src = llama_context_get_t_mtp_out(ctx_mtp);
@@ -755,7 +772,7 @@ struct common_speculative_state_mtp : public common_speculative_state {
                 return;
             }
 
-            const llama_token best = common_sampler_sample(s.smpl, ctx_mtp, 0);
+            const llama_token best = common_sampler_sample(s.smpl, ctx_mtp, /*idx=*/ 0);
             common_sampler_accept(s.smpl, best, /*accept_grammar=*/ false);
             draft_tokens.push_back(best);
             cond_tok = best;
@@ -765,13 +782,14 @@ struct common_speculative_state_mtp : public common_speculative_state {
         s.last_n_drafted = (uint16_t) draft_tokens.size();
     }
 
-    void accept(uint16_t n_accepted, llama_seq_id seq_id) override {
+    void accept(uint16_t n_accepted, llama_seq_id seq_id, int32_t tgt_row) override {
         auto & s = get_seq(seq_id);
         const llama_pos pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_mtp), seq_id);
         const int32_t n_drafted_last = (int32_t) s.last_n_drafted;
         const int32_t n_to_drop = std::max(0, n_drafted_last - (int32_t) n_accepted - 1);
         if (pos_max < 0) {
             s.last_n_accepted = (int32_t) n_accepted;
+            s.pending_tgt_row = tgt_row;
             return;
         }
         if (n_to_drop > 0) {
@@ -781,6 +799,7 @@ struct common_speculative_state_mtp : public common_speculative_state {
         }
         s.last_n_drafted  = 0;
         s.last_n_accepted = (int32_t) n_accepted;
+        s.pending_tgt_row = tgt_row;
     }
 
     int32_t n_max(const common_params_speculative & params) const override {
@@ -801,7 +820,7 @@ struct common_speculative_state_ngram_simple : public common_speculative_state {
             common_ngram_simple_config config)
         : common_speculative_state(type), config(config) {}
 
-    void begin(const llama_tokens & prompt, llama_seq_id /*seq_id*/) override {
+    void begin(const llama_tokens & prompt, llama_seq_id /*seq_id*/, int32_t /*tgt_row*/) override {
         GGML_UNUSED(prompt);
     }
 
@@ -816,7 +835,7 @@ struct common_speculative_state_ngram_simple : public common_speculative_state {
         GGML_UNUSED(params);
     }
 
-    void accept(uint16_t n_accepted, llama_seq_id /*seq_id*/) override {
+    void accept(uint16_t n_accepted, llama_seq_id /*seq_id*/, int32_t /*tgt_row*/) override {
         // noop
         GGML_UNUSED(n_accepted);
     }
@@ -839,7 +858,7 @@ struct common_speculative_state_ngram_map_k : public common_speculative_state {
             common_ngram_map config)
         : common_speculative_state(type), config(std::move(config)) {}
 
-    void begin(const llama_tokens & prompt, llama_seq_id /*seq_id*/) override {
+    void begin(const llama_tokens & prompt, llama_seq_id /*seq_id*/, int32_t /*tgt_row*/) override {
         common_ngram_map_begin(config, prompt);
     }
 
@@ -853,7 +872,7 @@ struct common_speculative_state_ngram_map_k : public common_speculative_state {
         GGML_UNUSED(params);
     }
 
-    void accept(uint16_t n_accepted, llama_seq_id /*seq_id*/) override {
+    void accept(uint16_t n_accepted, llama_seq_id /*seq_id*/, int32_t /*tgt_row*/) override {
         common_ngram_map_accept(config, n_accepted);
     }
 
@@ -886,7 +905,7 @@ struct common_speculative_state_ngram_mod : public common_speculative_state {
         static_assert(sizeof(llama_token) == sizeof(common_ngram_mod::entry_t));
     }
 
-    void begin(const llama_tokens & prompt, llama_seq_id /*seq_id*/) override {
+    void begin(const llama_tokens & prompt, llama_seq_id /*seq_id*/, int32_t /*tgt_row*/) override {
         i_last = 0;
 
         n_draft_last = 0;
@@ -970,7 +989,7 @@ struct common_speculative_state_ngram_mod : public common_speculative_state {
         n_draft_last = result.size();
     }
 
-    void accept(uint16_t n_accepted, llama_seq_id /*seq_id*/) override {
+    void accept(uint16_t n_accepted, llama_seq_id /*seq_id*/, int32_t /*tgt_row*/) override {
         // compute acceptance fraction if we have a recorded draft length
         if (n_draft_last > 0) {
             const double f_acc = (double)n_accepted / (double)n_draft_last;
@@ -1042,7 +1061,7 @@ struct common_speculative_state_ngram_cache : public common_speculative_state {
         }
     }
 
-    void begin(const llama_tokens & prompt, llama_seq_id /*seq_id*/) override {
+    void begin(const llama_tokens & prompt, llama_seq_id /*seq_id*/, int32_t /*tgt_row*/) override {
         GGML_UNUSED(prompt);
     }
 
@@ -1088,7 +1107,7 @@ struct common_speculative_state_ngram_cache : public common_speculative_state {
         }
     }
 
-    void accept(uint16_t n_accepted, llama_seq_id /*seq_id*/) override {
+    void accept(uint16_t n_accepted, llama_seq_id /*seq_id*/, int32_t /*tgt_row*/) override {
         // TODO: noop
         GGML_UNUSED(n_accepted);
     }
@@ -1338,14 +1357,14 @@ void common_speculative_free(common_speculative * spec) {
     delete spec;
 }
 
-void common_speculative_begin(common_speculative * spec, const llama_tokens & prompt, llama_seq_id seq_id) {
+void common_speculative_begin(common_speculative * spec, const llama_tokens & prompt, llama_seq_id seq_id, int32_t tgt_row) {
     if (spec == nullptr) {
         return;
     }
 
     for (auto & impl : spec->impls) {
         common_time_meas tm(impl->t_begin_us, !impl->gen_perf);
-        impl->begin(prompt, seq_id);
+        impl->begin(prompt, seq_id, tgt_row);
         impl->n_call_begin++;
     }
 }
@@ -1392,7 +1411,7 @@ llama_tokens common_speculative_draft(
     return result;
 }
 
-void common_speculative_accept(common_speculative * spec, uint16_t n_accepted, llama_seq_id seq_id) {
+void common_speculative_accept(common_speculative * spec, uint16_t n_accepted, llama_seq_id seq_id, int32_t tgt_row) {
     if (n_accepted == 0) {
         return;
     }
@@ -1408,7 +1427,7 @@ void common_speculative_accept(common_speculative * spec, uint16_t n_accepted, l
             impl->n_acc_tokens += n_accepted;
         }
 
-        impl->accept(n_accepted, seq_id);
+        impl->accept(n_accepted, seq_id, tgt_row);
         impl->n_call_accept++;
     }
 }
