@@ -21,17 +21,18 @@ common_speculative * common_speculative_init(
 void common_speculative_free(common_speculative * spec);
 
 // optionally call once at the beginning of a new generation
-void common_speculative_begin(common_speculative * spec, const llama_tokens & prompt);
+void common_speculative_begin(common_speculative * spec, const llama_tokens & prompt, llama_seq_id seq_id = 0);
 
 // sample up to n_draft tokens and add them to the batch using the draft model
 llama_tokens common_speculative_draft(
                      common_speculative * spec,
         const common_params_speculative & params,
                      const llama_tokens & prompt,
-                            llama_token   id_last);
+                            llama_token   id_last,
+                            llama_seq_id  seq_id = 0);
 
 // informs the speculative decoder that n_accepted tokens were accepted by the target model
-void common_speculative_accept(common_speculative * spec, uint16_t n_accepted);
+void common_speculative_accept(common_speculative * spec, uint16_t n_accepted, llama_seq_id seq_id = 0);
 
 int32_t common_speculative_n_max(const common_speculative * spec, const common_params_speculative & params);
 int32_t common_speculative_n_min(const common_speculative * spec, const common_params_speculative & params);

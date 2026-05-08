@@ -13,6 +13,7 @@
 #include <cstring>
 #include <iomanip>
 #include <map>
+#include <unordered_map>
 #include <cinttypes>
 
 #define SPEC_VOCAB_MAX_SIZE_DIFFERENCE  128
@@ -144,15 +145,16 @@ struct common_speculative_state {
 
     virtual ~common_speculative_state() = default;
 
-    virtual void begin(const llama_tokens & prompt) = 0;
+    virtual void begin(const llama_tokens & prompt, llama_seq_id seq_id) = 0;
 
     virtual void draft(
             const common_params_speculative & params,
             const llama_tokens & prompt_tgt,
             llama_token id_last,
-            llama_tokens & result) = 0;
+            llama_tokens & result,
+            llama_seq_id seq_id) = 0;
 
-    virtual void accept(uint16_t n_accepted) = 0;
+    virtual void accept(uint16_t n_accepted, llama_seq_id seq_id) = 0;
 
     virtual int32_t n_max(const common_params_speculative & params) const = 0;
     virtual int32_t n_min(const common_params_speculative & params) const = 0;
@@ -249,7 +251,7 @@ struct common_speculative_state_draft : public common_speculative_state {
         llama_batch_free(batch);
     }
 
-    void begin(const llama_tokens & /*prompt*/) override {
+    void begin(const llama_tokens & /*prompt*/, llama_seq_id /*seq_id*/) override {
     }
 
     size_t create_checkpoint(int n_tokens_prompt) {
@@ -288,7 +290,8 @@ struct common_speculative_state_draft : public common_speculative_state {
             const common_params_speculative & params,
             const llama_tokens & prompt_tgt,
             llama_token id_last,
-            llama_tokens & result) override {
+            llama_tokens & result,
+            llama_seq_id /*seq_id*/) override {
         const auto & sparams = params.draft;
 
         auto * spec = this;
@@ -526,7 +529,7 @@ struct common_speculative_state_draft : public common_speculative_state {
         }
     }
 
-    void accept(uint16_t n_accepted) override {
+    void accept(uint16_t n_accepted, llama_seq_id /*seq_id*/) override {
         // noop
         GGML_UNUSED(n_accepted);
     }
@@ -571,7 +574,7 @@ struct common_speculative_state_draft : public common_speculative_state {
 struct common_speculative_state_eagle3 : public common_speculative_state {
     common_speculative_state_eagle3(enum common_speculative_type type) : common_speculative_state(type) {}
 
-    void begin(const llama_tokens & prompt) override {
+    void begin(const llama_tokens & prompt, llama_seq_id /*seq_id*/) override {
         GGML_UNUSED(prompt);
     }
 
@@ -579,7 +582,8 @@ struct common_speculative_state_eagle3 : public common_speculative_state {
             const common_params_speculative & params,
             const llama_tokens & prompt_tgt,
             llama_token id_last,
-            llama_tokens & draft_tokens) override {
+            llama_tokens & draft_tokens,
+            llama_seq_id /*seq_id*/) override {
         // TODO: implement
         GGML_UNUSED(params);
         GGML_UNUSED(prompt_tgt);
@@ -587,7 +591,7 @@ struct common_speculative_state_eagle3 : public common_speculative_state {
         GGML_UNUSED(draft_tokens);
     }
 
-    void accept(uint16_t n_accepted) override {
+    void accept(uint16_t n_accepted, llama_seq_id /*seq_id*/) override {
         // noop
         GGML_UNUSED(n_accepted);
     }
@@ -605,12 +609,32 @@ struct common_speculative_state_mtp : public common_speculative_state {
     llama_context * ctx_tgt = nullptr;
     llama_context * ctx_mtp = nullptr;
 
-    llama_batch       batch;       // single token draft step
-    common_sampler  * smpl = nullptr;
-    int32_t           n_embd = 0;
+    llama_batch  batch;       // single token draft step (sized for n_seq_max slots)
+    int32_t      n_embd  = 0;
+    int32_t      n_slots = 1;
 
-    uint16_t last_n_drafted  = 0;
-    int32_t  last_n_accepted = -1;
+    // per-slot sampler and draft bookkeeping; concurrent slots can't share these.
+    struct seq_state {
+        common_sampler * smpl            = nullptr;
+        uint16_t         last_n_drafted  = 0;
+        int32_t          last_n_accepted = -1;
+    };
+    std::unordered_map<llama_seq_id, seq_state> seqs;
+
+    seq_state & get_seq(llama_seq_id seq_id) {
+        auto it = seqs.find(seq_id);
+        if (it != seqs.end()) {
+            return it->second;
+        }
+        const llama_model * model_mtp = llama_get_model(ctx_mtp);
+        common_params_sampling sparams;
+        sparams.no_perf  = false;
+        sparams.top_k    = 1;
+        sparams.samplers = { COMMON_SAMPLER_TYPE_TOP_K };
+        seq_state s;
+        s.smpl = common_sampler_init(model_mtp, sparams);
+        return seqs.emplace(seq_id, std::move(s)).first->second;
+    }
 
     common_speculative_state_mtp(enum common_speculative_type type,
                                  llama_context * ctx_tgt,
@@ -618,23 +642,15 @@ struct common_speculative_state_mtp : public common_speculative_state {
         : common_speculative_state(type), ctx_tgt(ctx_tgt), ctx_mtp(ctx_mtp) {
         GGML_ASSERT(ctx_tgt && ctx_mtp);
         const llama_model * model_mtp = llama_get_model(ctx_mtp);
-        n_embd = llama_model_n_embd(model_mtp);
+        n_embd  = llama_model_n_embd(model_mtp);
+        n_slots = std::max(1, (int32_t) llama_n_seq_max(ctx_tgt));
 
-        {
-            common_params_sampling sparams;
-            sparams.no_perf  = false;
-            sparams.top_k    = 1;
-            sparams.samplers = { COMMON_SAMPLER_TYPE_TOP_K };
-            smpl = common_sampler_init(model_mtp, sparams);
-        }
-
-        // TODO: multiple seq support
-        batch = llama_batch_init(/*n_tokens=*/ 1, /*embd=*/ n_embd, /*n_seq_max=*/ 1);
+        // Single-token draft batch; seq_id is set per-call in draft().
+        batch = llama_batch_init(/*n_tokens=*/ 1, /*embd=*/ n_embd, /*n_seq_max=*/ n_slots);
         batch.token = (llama_token *) malloc(sizeof(llama_token));
-        batch.n_tokens     = 1;
-        batch.n_seq_id[0]  = 1;
-        batch.seq_id[0][0] = 0;
-        batch.logits[0]    = 1;
+        batch.n_tokens    = 1;
+        batch.n_seq_id[0] = 1;
+        batch.logits[0]   = 1;
 
         llama_set_mtp(ctx_tgt, ctx_mtp);
     }
@@ -642,26 +658,30 @@ struct common_speculative_state_mtp : public common_speculative_state {
     ~common_speculative_state_mtp() override {
         llama_set_mtp(ctx_tgt, nullptr);
         llama_batch_free(batch);
-        common_sampler_free(smpl);
+        for (auto & kv : seqs) {
+            common_sampler_free(kv.second.smpl);
+        }
+        seqs.clear();
         if (ctx_mtp) {
             llama_free(ctx_mtp);
         }
     }
 
-    void begin(const llama_tokens & prompt) override {
-        last_n_accepted = -1;
-        last_n_drafted  = 0;
+    void begin(const llama_tokens & prompt, llama_seq_id seq_id) override {
+        auto & s = get_seq(seq_id);
+        s.last_n_accepted = -1;
+        s.last_n_drafted  = 0;
 
         const int32_t N = (int32_t) prompt.size();
         if (N <= 0) {
             return;
         }
-        const llama_pos pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_mtp), 0);
+        const llama_pos pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_mtp), seq_id);
         if (pos_max < N - 1) {
-            LOG_WRN("%s: ctx_mtp pos_max=%d < N-1=%d — "
+            LOG_WRN("%s: ctx_mtp pos_max=%d < N-1=%d (seq_id=%d) — "
                     "streaming hook may not be registered or not all prefill rows "
                     "have logits=true. Drafts may degrade.\n",
-                    __func__, (int) pos_max, N - 1);
+                    __func__, (int) pos_max, N - 1, (int) seq_id);
         }
     }
 
@@ -669,30 +689,35 @@ struct common_speculative_state_mtp : public common_speculative_state {
             const common_params_speculative & params,
             const llama_tokens & prompt_tgt,
             llama_token id_last,
-            llama_tokens & draft_tokens) override {
+            llama_tokens & draft_tokens,
+            llama_seq_id seq_id) override {
         GGML_UNUSED(prompt_tgt);
         draft_tokens.clear();
 
+        auto & s = get_seq(seq_id);
+
         // accept with no-accepts (i.e. 0 accepts) returns early, but we still need to remove from the MTP kv-cache
-        // TODO: check if bug in other spec states
-        if (last_n_drafted > 0) {
-            const int32_t n_to_drop = (int32_t) last_n_drafted - 1;
+        if (s.last_n_drafted > 0) {
+            const int32_t n_to_drop = (int32_t) s.last_n_drafted - 1;
             if (n_to_drop > 0) {
-                const llama_pos pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_mtp), 0);
+                const llama_pos pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_mtp), seq_id);
                 if (pos_max >= 0) {
                     const llama_pos drop_from = pos_max - n_to_drop + 1;
-                    llama_memory_seq_rm(llama_get_memory(ctx_mtp), 0, drop_from, -1);
+                    llama_memory_seq_rm(llama_get_memory(ctx_mtp), seq_id, drop_from, -1);
                 }
             }
-            last_n_drafted  = 0;
-            last_n_accepted = 0;
+            s.last_n_drafted  = 0;
+            s.last_n_accepted = 0;
         }
 
         const int32_t n_max     = std::max(1, params.draft.n_max);
         const size_t  row_bytes = (size_t) n_embd * sizeof(float);
 
         llama_token cond_tok = id_last;
-        llama_pos   pos      = llama_memory_seq_pos_max(llama_get_memory(ctx_mtp), 0) + 1;
+        llama_pos   pos      = llama_memory_seq_pos_max(llama_get_memory(ctx_mtp), seq_id) + 1;
+
+        batch.n_seq_id[0]  = 1;
+        batch.seq_id[0][0] = seq_id;
 
         // auto-regressive loop for MTP
         for (int32_t k = 0; k < n_max; ++k) {
@@ -700,12 +725,12 @@ struct common_speculative_state_mtp : public common_speculative_state {
             int32_t       src_row;
             if (k == 0) {
                 src = llama_context_get_t_h_pre_norm(ctx_tgt);
-                if (last_n_accepted < 0) {
+                if (s.last_n_accepted < 0) {
                     // First draft after begin(): trunk's most recent decode is
                     // the last prefill ubatch; its last row is h_{N-1}.
                     src_row = (src && src->ne[1] > 0) ? (int32_t) src->ne[1] - 1 : 0;
                 } else {
-                    src_row = last_n_accepted;
+                    src_row = s.last_n_accepted;
                 }
                 llama_synchronize(ctx_tgt);
             } else {
@@ -730,31 +755,32 @@ struct common_speculative_state_mtp : public common_speculative_state {
                 return;
             }
 
-            const llama_token best = common_sampler_sample(smpl, ctx_mtp, 0);
-            common_sampler_accept(smpl, best, /*accept_grammar=*/ false);
+            const llama_token best = common_sampler_sample(s.smpl, ctx_mtp, 0);
+            common_sampler_accept(s.smpl, best, /*accept_grammar=*/ false);
             draft_tokens.push_back(best);
             cond_tok = best;
             ++pos;
         }
 
-        last_n_drafted = (uint16_t) draft_tokens.size();
+        s.last_n_drafted = (uint16_t) draft_tokens.size();
     }
 
-    void accept(uint16_t n_accepted) override {
-        const llama_pos pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_mtp), 0);
-        const int32_t n_drafted_last = (int32_t) last_n_drafted;
+    void accept(uint16_t n_accepted, llama_seq_id seq_id) override {
+        auto & s = get_seq(seq_id);
+        const llama_pos pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_mtp), seq_id);
+        const int32_t n_drafted_last = (int32_t) s.last_n_drafted;
         const int32_t n_to_drop = std::max(0, n_drafted_last - (int32_t) n_accepted - 1);
         if (pos_max < 0) {
-            last_n_accepted = (int32_t) n_accepted;
+            s.last_n_accepted = (int32_t) n_accepted;
             return;
         }
         if (n_to_drop > 0) {
             const llama_pos drop_from = pos_max - n_to_drop + 1;
-            llama_memory_seq_rm(llama_get_memory(ctx_mtp), /*seq_id=*/ 0,
+            llama_memory_seq_rm(llama_get_memory(ctx_mtp), seq_id,
                                 /*p0=*/ drop_from, /*p1=*/ -1);
         }
-        last_n_drafted = 0;
-        last_n_accepted = (int32_t) n_accepted;
+        s.last_n_drafted  = 0;
+        s.last_n_accepted = (int32_t) n_accepted;
     }
 
     int32_t n_max(const common_params_speculative & params) const override {
@@ -775,7 +801,7 @@ struct common_speculative_state_ngram_simple : public common_speculative_state {
             common_ngram_simple_config config)
         : common_speculative_state(type), config(config) {}
 
-    void begin(const llama_tokens & prompt) override {
+    void begin(const llama_tokens & prompt, llama_seq_id /*seq_id*/) override {
         GGML_UNUSED(prompt);
     }
 
@@ -783,13 +809,14 @@ struct common_speculative_state_ngram_simple : public common_speculative_state {
             const common_params_speculative & params,
             const llama_tokens & prompt_tgt,
             llama_token id_last,
-            llama_tokens & result) override {
+            llama_tokens & result,
+            llama_seq_id /*seq_id*/) override {
 
         result = common_ngram_simple_draft(config, prompt_tgt, id_last);
         GGML_UNUSED(params);
     }
 
-    void accept(uint16_t n_accepted) override {
+    void accept(uint16_t n_accepted, llama_seq_id /*seq_id*/) override {
         // noop
         GGML_UNUSED(n_accepted);
     }
@@ -812,7 +839,7 @@ struct common_speculative_state_ngram_map_k : public common_speculative_state {
             common_ngram_map config)
         : common_speculative_state(type), config(std::move(config)) {}
 
-    void begin(const llama_tokens & prompt) override {
+    void begin(const llama_tokens & prompt, llama_seq_id /*seq_id*/) override {
         common_ngram_map_begin(config, prompt);
     }
 
@@ -820,12 +847,13 @@ struct common_speculative_state_ngram_map_k : public common_speculative_state {
             const common_params_speculative & params,
             const llama_tokens & prompt_tgt,
             llama_token id_last,
-            llama_tokens & result) override {
+            llama_tokens & result,
+            llama_seq_id /*seq_id*/) override {
         common_ngram_map_draft(config, prompt_tgt, id_last, result);
         GGML_UNUSED(params);
     }
 
-    void accept(uint16_t n_accepted) override {
+    void accept(uint16_t n_accepted, llama_seq_id /*seq_id*/) override {
         common_ngram_map_accept(config, n_accepted);
     }
 
@@ -858,7 +886,7 @@ struct common_speculative_state_ngram_mod : public common_speculative_state {
         static_assert(sizeof(llama_token) == sizeof(common_ngram_mod::entry_t));
     }
 
-    void begin(const llama_tokens & prompt) override {
+    void begin(const llama_tokens & prompt, llama_seq_id /*seq_id*/) override {
         i_last = 0;
 
         n_draft_last = 0;
@@ -890,7 +918,8 @@ struct common_speculative_state_ngram_mod : public common_speculative_state {
             const common_params_speculative & params,
             const llama_tokens & prompt_tgt,
             llama_token id_last,
-            llama_tokens & result) override {
+            llama_tokens & result,
+            llama_seq_id /*seq_id*/) override {
         const auto & sparams = params.ngram_mod;
 
         n_draft_last = 0;
@@ -941,7 +970,7 @@ struct common_speculative_state_ngram_mod : public common_speculative_state {
         n_draft_last = result.size();
     }
 
-    void accept(uint16_t n_accepted) override {
+    void accept(uint16_t n_accepted, llama_seq_id /*seq_id*/) override {
         // compute acceptance fraction if we have a recorded draft length
         if (n_draft_last > 0) {
             const double f_acc = (double)n_accepted / (double)n_draft_last;
@@ -1013,7 +1042,7 @@ struct common_speculative_state_ngram_cache : public common_speculative_state {
         }
     }
 
-    void begin(const llama_tokens & prompt) override {
+    void begin(const llama_tokens & prompt, llama_seq_id /*seq_id*/) override {
         GGML_UNUSED(prompt);
     }
 
@@ -1021,7 +1050,8 @@ struct common_speculative_state_ngram_cache : public common_speculative_state {
             const common_params_speculative & params,
             const llama_tokens & prompt_tgt,
             llama_token id_last,
-            llama_tokens & result) override {
+            llama_tokens & result,
+            llama_seq_id /*seq_id*/) override {
         GGML_UNUSED(params);
 
         if (cache_size < prompt_tgt.size() + 1) {
@@ -1058,7 +1088,7 @@ struct common_speculative_state_ngram_cache : public common_speculative_state {
         }
     }
 
-    void accept(uint16_t n_accepted) override {
+    void accept(uint16_t n_accepted, llama_seq_id /*seq_id*/) override {
         // TODO: noop
         GGML_UNUSED(n_accepted);
     }
@@ -1308,14 +1338,14 @@ void common_speculative_free(common_speculative * spec) {
     delete spec;
 }
 
-void common_speculative_begin(common_speculative * spec, const llama_tokens & prompt) {
+void common_speculative_begin(common_speculative * spec, const llama_tokens & prompt, llama_seq_id seq_id) {
     if (spec == nullptr) {
         return;
     }
 
     for (auto & impl : spec->impls) {
         common_time_meas tm(impl->t_begin_us, !impl->gen_perf);
-        impl->begin(prompt);
+        impl->begin(prompt, seq_id);
         impl->n_call_begin++;
     }
 }
@@ -1324,7 +1354,8 @@ llama_tokens common_speculative_draft(
         common_speculative * spec,
         const common_params_speculative & params,
         const llama_tokens & prompt_tgt, // specified in target model vocab
-        llama_token id_last) {
+        llama_token id_last,
+        llama_seq_id seq_id) {
     llama_tokens result;
 
     spec->curr_impl = nullptr; // reset current implementation
@@ -1332,7 +1363,7 @@ llama_tokens common_speculative_draft(
     for (auto & impl : spec->impls) {
         {
             common_time_meas tm(impl->t_draft_us, !impl->gen_perf);
-            impl->draft(params, prompt_tgt, id_last, result);
+            impl->draft(params, prompt_tgt, id_last, result, seq_id);
             impl->n_call_draft++;
         }
 
@@ -1361,7 +1392,7 @@ llama_tokens common_speculative_draft(
     return result;
 }
 
-void common_speculative_accept(common_speculative * spec, uint16_t n_accepted) {
+void common_speculative_accept(common_speculative * spec, uint16_t n_accepted, llama_seq_id seq_id) {
     if (n_accepted == 0) {
         return;
     }
@@ -1377,7 +1408,7 @@ void common_speculative_accept(common_speculative * spec, uint16_t n_accepted) {
             impl->n_acc_tokens += n_accepted;
         }
 
-        impl->accept(n_accepted);
+        impl->accept(n_accepted, seq_id);
         impl->n_call_accept++;
     }
 }

@@ -360,7 +360,7 @@ struct server_slot {
                 GGML_ASSERT(spec_i_batch.empty());
 
                 // generate a new draft
-                spec_draft = common_speculative_draft(spec.get(), params_spec, tokens, sampled);
+                spec_draft = common_speculative_draft(spec.get(), params_spec, tokens, sampled, /*seq_id=*/ this->id);
                 n_draft_total += spec_draft.size();
 
                 if (spec_draft.size() > (size_t) n_draft_max) {
@@ -845,15 +845,10 @@ private:
                 return false;
             }
 
-            if (params_base.n_parallel > 1) {
-                SRV_ERR("MTP currently supports only n_parallel=1; got %d\n", params_base.n_parallel);
-                return false;
-            }
-
             auto cparams_mtp = common_context_params_to_llama(params_base);
-            cparams_mtp.n_ctx     = llama_n_ctx_seq(ctx);
-            cparams_mtp.n_seq_max = 1;
-            cparams_mtp.n_rs_seq = 0;
+            cparams_mtp.n_ctx     = llama_n_ctx_seq(ctx) * (uint32_t) params_base.n_parallel;
+            cparams_mtp.n_seq_max = (uint32_t) params_base.n_parallel;
+            cparams_mtp.n_rs_seq  = 0;
 
             params_base.speculative.mtp.model   = model_mtp.get();
             params_base.speculative.mtp.cparams = cparams_mtp;
@@ -2995,7 +2990,7 @@ private:
                     slot.state = SLOT_STATE_GENERATING;
 
                     if (slot.can_speculate()) {
-                        common_speculative_begin(slot.spec.get(), slot.prompt.tokens.get_text_tokens());
+                        common_speculative_begin(slot.spec.get(), slot.prompt.tokens.get_text_tokens(), /*seq_id=*/ slot.id);
                     }
                 } else if (slot.state != SLOT_STATE_GENERATING) {
                     continue; // continue loop of slots
@@ -3110,7 +3105,7 @@ private:
                         SLT_INF(slot, "accepted %2zu/%2zu draft tokens\n", accepted.size() - 1, n_draft);
                     }
 
-                    common_speculative_accept(slot.spec.get(), accepted.size() - 1);
+                    common_speculative_accept(slot.spec.get(), accepted.size() - 1, /*seq_id=*/ slot.id);
 
                     slot.spec_draft = std::move(accepted);
                 }
