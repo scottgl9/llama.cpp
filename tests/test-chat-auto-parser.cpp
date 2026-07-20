@@ -1455,7 +1455,6 @@ static void test_laguna_s_analysis(testing & t) {
     t.test("Laguna-S(v8) reasoning detection", test_laguna_s_reasoning_detection);
     t.test("Laguna-S(v8) tool format", test_laguna_s_tool_format);
 }
-
 static common_chat_template load_laguna_xs2_template(testing & t) {
     return load_template(t, "models/templates/poolside-Laguna-XS.2.jinja");
 }
